@@ -7,13 +7,15 @@ import { useBurstFeed } from "@/lib/realtime/useBurst";
 import { formatFeedTime } from "@/lib/realtime/format";
 import { RealtimeProfiler } from "@/components/realtime-profiler";
 import Link from "next/link";
-import { useMarkets, useInfiniteMarkets } from "@/lib/hooks/useMarkets";
+import { useMarkets, useInfiniteMarkets, useMarketQuestionIntegrity } from "@/lib/hooks/useMarkets";
 import { useOnChainMarket, useOnChainMarkets, type OnChainMarketView } from "@/lib/hooks/useStellar";
 import type { Market, MarketStatus, MarketTracePreview } from "@/lib/api/markets";
+import { floatUsdcToRaw, formatBps, formatUsdcDisplay } from "@/lib/format/money";
 import { BACKEND_CATEGORIES, BACKEND_CATEGORY_LABELS } from "@/lib/stellar/categories";
-import { formatUsdc } from "@/lib/stellar/units";
 import { NETWORK_LABEL } from "@/lib/stellar/config";
 import { VirtualList } from "@/components/ui/virtual-list";
+import { QuestionVerificationBadge } from "@/components/question-verification-badge";
+import { bytesToHex } from "@/lib/stellar/typed-call";
 
 const SourceTag = ({ source }: { source: "chain" | "backend" }) => (
   <span
@@ -97,12 +99,15 @@ interface MarketCardProps {
   reasoningTraces?: MarketTracePreview[];
   expiry: string;
   title: string;
-  backendYesProb: number | null;
+  backendYesProb?: number | null;
   backendLiquidity: string | null;
+  marketId?: string | null;
+  metaUri?: string | null;
+  questionHash?: string | null;
   disableEntrance?: boolean;
 }
 
-const MarketCard = ({ href, category, onChainMarketId, reasoningTraces, expiry, title, backendYesProb, backendLiquidity, disableEntrance }: MarketCardProps) => {
+const MarketCard = ({ href, category, onChainMarketId, reasoningTraces, expiry, title, backendYesProb, backendLiquidity, disableEntrance, marketId, metaUri, questionHash }: MarketCardProps) => {
   const reduceMotion = useReducedMotion();
   const shouldAnimate = !disableEntrance && !reduceMotion;
   const chain = useOnChainMarket(onChainMarketId);
@@ -111,13 +116,21 @@ const MarketCard = ({ href, category, onChainMarketId, reasoningTraces, expiry, 
   const yesProb = view ? Math.round(view.yesBps / 100) : backendYesProb ?? 50;
   const noProb = 100 - yesProb;
   const liquidity = view
-    ? `$${formatUsdc(view.market.sets_minted, { maxDecimals: 2, grouping: true })}`
+    ? formatUsdcDisplay(view.market.sets_minted)
     : backendLiquidity ?? "—";
   const platform = onChainMarketId !== null ? `On-chain #${onChainMarketId}` : "Not on-chain yet";
   const latestTrace = reasoningTraces?.[0];
   const aiSignal = latestTrace ? (latestTrace.edge > 0.05 ? "BULLISH" : latestTrace.edge < -0.05 ? "BEARISH" : "NEUTRAL") : "ANALYZING";
   const aiStatus = latestTrace ? `${Math.abs(latestTrace.edge * 100).toFixed(1)}% EDGE` : "STABLE";
   const volume24h = chainStatusLabel(view);
+
+  const questionIntegrity = useMarketQuestionIntegrity({
+    marketId,
+    onChainMarketId,
+    displayedQuestion: title,
+    metaUri: view?.market.meta_uri ?? metaUri,
+    questionHash: view?.market.question_hash ?? questionHash,
+  });
 
   const cardContent = (
     <>
@@ -238,9 +251,9 @@ const TradingFeed = () => {
       key: data.eventId,
       time: formatFeedTime(data.closedAt ?? event.receivedAt) + (data.closedAt ? "" : " received"),
       market: data.marketQuestion || `Market #${data.onChainMarketId}`,
-      size: `$${formatUsdc(BigInt(data.collateralRaw), { maxDecimals: 2, grouping: true })}`,
+      size: formatUsdcDisplay(BigInt(data.collateralRaw)),
       bet: `${data.isBuy ? "BUY" : "SELL"} ${data.direction}`,
-      prob: `YES ${(data.priceYesBps / 100).toFixed(1)}%`,
+      prob: `YES ${formatBps(data.priceYesBps)}`,
       color: data.direction === "YES" ? "text-secondary" : "text-tertiary",
     }];
   });
@@ -306,13 +319,15 @@ function OnChainOnlyMarkets({ knownIds }: { knownIds: Set<string> }) {
         {orphans.map((v) => (
           <MarketCard
             key={v.id}
-            href={`/markets/quick-view?onChainId=${v.id}`}
+            href={`/markets/quick-view?onChainId=${v.id}&from=markets`}
             category={v.market.category.tag}
             onChainMarketId={v.id}
             expiry={new Date(Number(v.market.close_time) * 1000).toLocaleDateString('en-US', { month: 'short', year: '2-digit' }).toUpperCase()}
             title={`Market #${v.id} · ${v.market.meta_uri}`}
             backendYesProb={null}
             backendLiquidity={null}
+            metaUri={v.market.meta_uri}
+            questionHash={v.market.question_hash ? bytesToHex(v.market.question_hash) : null}
           />
         ))}
       </div>
@@ -363,6 +378,14 @@ export default function MarketsPageClient() {
           setStatus={handleSetStatus}
           category={category}
           setCategory={setCategory}
+        <h1 id="markets-heading" tabIndex={-1} className="sr-only outline-none">
+          Markets
+        </h1>
+        <FilterBar 
+          status={status} 
+          setStatus={(s) => setStatus(s as MarketStatus)} 
+          category={category} 
+          setCategory={setCategory} 
         />
         {isLoading ? (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
@@ -411,18 +434,22 @@ export default function MarketsPageClient() {
               }}
               renderItem={(m, _idx, a11y) => {
                 const rawProb = m.currentYesProb ?? m.initialYesProb;
+                const hasSeed = Boolean(m.seedAmountRaw);
+                const rawLiq = hasSeed ? BigInt(m.seedAmountRaw!) : floatUsdcToRaw(m.totalLiquidity);
                 return (
                   <div {...a11y}>
                     <MarketCard 
-                      href={`/markets/quick-view?marketId=${m.id}`}
+                      href={`/markets/quick-view?marketId=${m.id}&from=markets`}
                       category={m.category}
                       onChainMarketId={m.onChainMarketId}
                       reasoningTraces={m.reasoningTraces}
                       expiry={new Date(m.expiryTimestamp).toLocaleDateString('en-US', { month: 'short', year: '2-digit' }).toUpperCase()}
                       title={m.question}
-                      backendYesProb={Math.round(rawProb * 100)}
-                      backendLiquidity={`$${(m.totalLiquidity).toLocaleString()}`}
+                      backendLiquidity={rawLiq !== null ? `${formatUsdcDisplay(rawLiq)}${hasSeed ? " (seed)" : " (backend record)"}` : "—"}
                       disableEntrance
+                      marketId={m.id}
+                      metaUri={m.metaUri}
+                      questionHash={m.questionHash}
                     />
                   </div>
                 );

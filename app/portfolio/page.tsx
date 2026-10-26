@@ -2,16 +2,28 @@
 import { Icon } from "@/components/ui/icon";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { motion } from "framer-motion";
 import { usePortfolio, usePositions } from "@/lib/hooks/usePortfolio";
-import { useMyPositions } from "@/lib/hooks/useMyPositions";
+import { useAddressPositions, useMyPositions } from "@/lib/hooks/useMyPositions";
+import { useViewedAddress } from "@/lib/hooks/useViewedAddress";
+import {
+  floatUsdcToRaw,
+  formatBps,
+  formatProbability,
+  formatSignedUsdc,
+  formatUsdcDisplay,
+  ratioBps,
+} from "@/lib/format/money";
+import { useTreasuryValuation } from "@/lib/portfolio/useValuation";
 import { formatUsdc } from "@/lib/stellar/units";
+import { NETWORK_LABEL } from "@/lib/stellar/config";
 import { useWallet } from "@/lib/contexts/WalletContext";
 import { useRedeemAll, type PreparedWriteReview } from "@/lib/hooks/useStellar";
 import { shouldSkipTxReview, TxReview, TxReviewPreferenceControl } from "@/components/tx-review";
 import type { ReviewModel } from "@/lib/stellar/tx-decode";
 import { TreasuryRiskLimits } from "@/components/treasury-risk-limits";
 import { VirtualTableBody } from "@/components/ui/virtual-list";
+import { ExportHistoryDialog } from "@/components/portfolio/export-history-dialog";
+import { PendingCopyTrades } from "@/components/copy-trade/PendingCopyTrades";
 
 const TerminalLog = () => {
   const [logs, setLogs] = useState([
@@ -81,9 +93,12 @@ interface PositionRowProps {
   side: string;
   sideColor: string;
   entry: string;
-  prob: number;
+  prob: number | null;
   yesNo: string;
   size: string;
+  exitValue: string;
+  exitSubLabel?: string;
+  cappedWarning?: string | null;
   pnl: string;
   pnlPercent: string;
   pnlColor: string;
@@ -93,7 +108,7 @@ interface PositionRowProps {
   ariaRowIndex?: number;
 }
 
-const PositionRow = ({ market, category, platform, side, sideColor, entry, prob, yesNo, size, pnl, pnlPercent, pnlColor, status, resolved, claimable, ariaRowIndex }: PositionRowProps) => {
+const PositionRow = ({ market, category, platform, side, sideColor, entry, prob, yesNo, size, exitValue, exitSubLabel, cappedWarning, pnl, pnlPercent, pnlColor, status, resolved, claimable, ariaRowIndex }: PositionRowProps) => {
   return (
     <tr
       aria-rowindex={ariaRowIndex}
@@ -109,25 +124,45 @@ const PositionRow = ({ market, category, platform, side, sideColor, entry, prob,
       </td>
       <td className="px-4 py-4 text-right font-data-mono">{entry}</td>
       <td className="px-4 py-4">
-        <div className="flex flex-col gap-1 w-32 mx-auto">
-          <div className="flex justify-between text-[10px] text-outline font-bold">
-            <span>{prob}%</span>
-            <span>{yesNo}</span>
+        {prob === null ? (
+          <div className="text-center font-data-mono text-outline">—</div>
+        ) : (
+          <div className="flex flex-col gap-1 w-32 mx-auto">
+            <div className="flex justify-between text-[10px] text-outline font-bold">
+              <span>{prob}%</span>
+              <span>{yesNo}</span>
+            </div>
+            <div className="h-1 bg-outline-variant rounded-full overflow-hidden relative">
+              <div 
+                className={`h-full absolute left-0 top-0 ${side === 'YES' ? 'bg-secondary' : 'bg-tertiary'}`} 
+                style={{ width: `${prob}%` }}
+              ></div>
+            </div>
           </div>
-          <div className="h-1 bg-outline-variant rounded-full overflow-hidden relative">
-            <div 
-              className={`h-full absolute left-0 top-0 ${side === 'YES' ? 'bg-secondary' : 'bg-tertiary'}`} 
-              style={{ width: `${prob}%` }}
-            ></div>
-          </div>
-        </div>
+        )}
       </td>
-      <td className="px-4 py-4 text-right font-data-mono">{size}</td>
+      <td className="px-4 py-4 text-right font-data-mono">
+        <div>{size}</div>
+        <div className="text-[10px] text-outline">Backend record</div>
+      </td>
+      <td className="px-4 py-4 text-right font-data-mono">
+        <div className="font-semibold text-on-surface">{exitValue}</div>
+        {exitSubLabel && <div className="text-[10px] text-outline">{exitSubLabel}</div>}
+        {cappedWarning && (
+          <span
+            role="status"
+            className="mt-1 inline-block rounded bg-error-container px-1.5 py-0.5 text-[10px] font-bold text-tertiary-container"
+          >
+            {cappedWarning}
+          </span>
+        )}
+      </td>
       <td className="px-4 py-4 text-right font-data-mono">
         <div className={`${pnlColor} font-bold`}>{pnl}</div>
         <div className={`text-[11px] ${pnlColor === 'text-secondary' ? 'text-secondary-container bg-on-secondary-fixed-variant' : 'text-tertiary-container bg-error-container'} px-1 rounded inline-block`}>
           {pnlPercent}
         </div>
+        <div className="text-[10px] text-outline">Backend record</div>
       </td>
       <td className="px-4 py-4 text-center">
         <span className={`text-[10px] ${resolved ? 'bg-on-background text-surface' : 'bg-primary-container text-on-primary-container'} px-2 py-0.5 rounded-full uppercase`}>
@@ -165,6 +200,7 @@ const PositionRow = ({ market, category, platform, side, sideColor, entry, prob,
 
 export default function PortfolioPage() {
   const [status, setStatus] = useState<"OPEN" | "CLOSED">("OPEN");
+  const [exportOpen, setExportOpen] = useState(false);
   const wallet = useWallet();
   const redeemBatch = useRedeemAll();
   const [reviewModel, setReviewModel] = useState<{ model: ReviewModel; changedFrom?: ReviewModel } | null>(null);
@@ -172,6 +208,16 @@ export default function PortfolioPage() {
   const { data: summary, isLoading: isSummaryLoading } = usePortfolio();
   const { data: positionsData, isLoading: isPositionsLoading } = usePositions({ status });
   const positions = positionsData?.positions ?? [];
+  const rawTreasuryValuation = useTreasuryValuation(positions);
+  const treasuryValuation = {
+    ...rawTreasuryValuation,
+    basis: rawTreasuryValuation.mode,
+    setBasis: rawTreasuryValuation.setMode,
+  };
+  const { viewed, isWatching, setWatch, clearWatch } = useViewedAddress();
+  const [watchInput, setWatchInput] = useState("");
+  const activeHolder = viewed ?? wallet.address;
+  const addressPositions = useAddressPositions(activeHolder);
   const myPositions = useMyPositions();
   const currentRedeemIds = new Set(redeemBatch.discovery?.redeemables.map((item) => item.marketId.toString()) ?? []);
   const currentRedeemed = redeemBatch.discovery?.redeemables.filter(
@@ -213,6 +259,7 @@ export default function PortfolioPage() {
 
   return (
     <main className="max-w-container-max-width mx-auto px-gutter py-8">
+      <PendingCopyTrades />
       {/* Portfolio Header / Summary */}
       <section className="mb-8 flex flex-col md:flex-row justify-between items-end gap-6">
         <div>
@@ -226,7 +273,12 @@ export default function PortfolioPage() {
           <div className="bg-white border border-outline-variant p-4 rounded min-w-[160px] shadow-sm">
             <div className="font-label-caps text-label-caps text-outline mb-1">EQUITY (AGENT BOOK, USDC)</div>
             <div className="font-headline-sm text-headline-sm text-on-background">
-              {isSummaryLoading ? "..." : `$${summary?.totalUsdc.toLocaleString()}`}
+              {isSummaryLoading
+                ? "..."
+                : (() => {
+                    const raw = floatUsdcToRaw(summary?.totalUsdc);
+                    return raw !== null ? formatUsdcDisplay(raw) : "—";
+                  })()}
             </div>
             <div className="text-[10px] font-bold text-on-surface-variant mt-1">Backend record of the agent&apos;s holdings</div>
             <div className={`text-[12px] font-bold ${(summary?.dailyPnl ?? 0) >= 0 ? 'text-secondary' : 'text-tertiary'} flex items-center gap-1 mt-1`}>
@@ -234,14 +286,54 @@ export default function PortfolioPage() {
                 name={(summary?.dailyPnl ?? 0) >= 0 ? 'arrow_upward' : 'arrow_downward'}
                 className="text-[14px]"
               /> 
-              {isSummaryLoading ? "0.0%" : `${Math.abs(summary?.dailyPnl ?? 0).toFixed(2)}%`}
+              {isSummaryLoading
+                ? "..."
+                : (() => {
+                    const raw = floatUsdcToRaw(summary?.dailyPnl);
+                    return raw !== null ? `${formatSignedUsdc(raw)} today (backend record)` : "—";
+                  })()}
+            </div>
+          </div>
+
+          <div
+            className="bg-white border border-outline-variant p-4 rounded min-w-[200px] shadow-sm"
+            title="What selling everything now would return after price impact and fees"
+          >
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <span className="font-label-caps text-label-caps text-outline">
+                {treasuryValuation.basis === "exit" ? "EXIT VALUE (ON-CHAIN)" : "MID VALUE (ON-CHAIN)"}
+              </span>
+              <div className="inline-flex rounded border border-outline-variant bg-surface-container p-0.5 text-[10px] font-label-caps">
+                <button
+                  type="button"
+                  aria-pressed={treasuryValuation.basis === "exit"}
+                  onClick={() => treasuryValuation.setBasis("exit")}
+                  className={`rounded px-1.5 py-0.5 transition-colors ${treasuryValuation.basis === "exit" ? "bg-white font-bold text-primary shadow-sm" : "text-on-surface-variant"}`}
+                >
+                  Exit
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={treasuryValuation.basis === "mid"}
+                  onClick={() => treasuryValuation.setBasis("mid")}
+                  className={`rounded px-1.5 py-0.5 transition-colors ${treasuryValuation.basis === "mid" ? "bg-white font-bold text-primary shadow-sm" : "text-on-surface-variant"}`}
+                >
+                  Mid
+                </button>
+              </div>
+            </div>
+            <div className="font-headline-sm text-headline-sm text-on-background">
+              {treasuryValuation.isLoading ? "..." : formatUsdcDisplay(treasuryValuation.activeTotalRaw)}
+            </div>
+            <div className="text-[10px] font-bold text-on-surface-variant mt-1">
+              What selling everything now would return after price impact and fees
             </div>
           </div>
           
           <div className="bg-white border border-outline-variant p-4 rounded min-w-[160px] shadow-sm">
             <div className="font-label-caps text-label-caps text-outline mb-1">TREASURY CAPITAL</div>
             <div className="font-headline-sm text-headline-sm text-secondary">
-              {isSummaryLoading ? "..." : summary?.availableCapitalRaw ? `${formatUsdc(BigInt(summary.availableCapitalRaw), { maxDecimals: 2, grouping: true })} USDC` : "—"}
+              {isSummaryLoading ? "..." : summary?.availableCapitalRaw ? formatUsdcDisplay(BigInt(summary.availableCapitalRaw)) : "—"}
             </div>
             <div className="text-[10px] font-bold text-on-surface-variant mt-1">Read live from the treasury contract</div>
           </div>
@@ -256,40 +348,134 @@ export default function PortfolioPage() {
         </div>
       </section>
 
-      {/* User's own on-chain positions (issue #50), read from ledger entries */}
-      <section className="mb-8" aria-labelledby="my-positions-title">
-        <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
-          <h2 id="my-positions-title" className="font-headline-sm text-headline-sm text-on-background">My positions</h2>
-          <p className="text-[11px] font-medium text-on-surface-variant">
-            From your wallet&apos;s market-core ledger entries · not the agent&apos;s book
-          </p>
+      {/* Per-address on-chain positions (issue #141 & #50), read from ledger entries */}
+      <section className="mb-8" aria-labelledby="address-positions-title">
+        <div className="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 id="address-positions-title" className="font-headline-sm text-headline-sm text-on-background">
+                Positions for {activeHolder ? shortAddress(activeHolder, 6, 4) : "Address"}
+              </h2>
+              {isWatching && (
+                <span className="rounded-full bg-primary/10 text-primary border border-primary/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider">
+                  Watching
+                </span>
+              )}
+              {activeHolder && activeHolder === deployments.agent && (
+                <span className="rounded-full bg-secondary/10 text-secondary border border-secondary/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider">
+                  Treasury Agent
+                </span>
+              )}
+            </div>
+            <p className="text-[11px] font-medium text-on-surface-variant">
+              Read directly from market-core ledger entries on Stellar Testnet · not the agent&apos;s book
+            </p>
+          </div>
+          {wallet.isConnected && activeHolder === wallet.address && (
+            <button
+              type="button"
+              onClick={() => setExportOpen(true)}
+              className="inline-flex items-center gap-2 rounded border border-outline-variant bg-white px-4 py-2 text-xs font-label-caps font-bold text-primary shadow-sm hover:bg-surface-container-low"
+            >
+              <Icon name="download" className="text-[16px]" />
+              Export my history
+            </button>
+          )}
         </div>
-        <div className="rounded-xl border border-outline-variant bg-white shadow-sm">
+
+        {/* Address Input & Quick Picks */}
+        <div className="bg-surface-container-low border border-outline-variant rounded-xl p-4 mb-4">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const trimmed = watchInput.trim();
+              if (!trimmed) return;
+              if (setWatch(trimmed)) {
+                setWatchInput("");
+              }
+            }}
+            className="flex flex-col sm:flex-row gap-2 mb-3"
+          >
+            <input
+              type="text"
+              placeholder="Watch an address (G... or C...)"
+              value={watchInput}
+              onChange={(e) => setWatchInput(e.target.value)}
+              className="flex-1 bg-white border border-outline-variant rounded-lg px-3 py-2 text-xs font-mono outline-none focus:ring-2 focus:ring-primary"
+            />
+            <button
+              type="submit"
+              className="bg-primary text-primary-foreground px-4 py-2 rounded-lg text-xs font-bold font-label-caps hover:brightness-110 transition-all shrink-0"
+            >
+              Watch
+            </button>
+          </form>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-[11px] text-on-surface-variant font-medium">Quick picks:</span>
+            {wallet.isConnected && wallet.address && (
+              <button
+                type="button"
+                onClick={() => { if (wallet.address) setWatch(wallet.address); }}
+                className={`px-2.5 py-1 rounded border text-xs transition-colors ${
+                  activeHolder === wallet.address && !isWatching
+                    ? "bg-primary text-primary-foreground border-primary font-bold"
+                    : "bg-white border-outline-variant hover:border-primary text-on-surface"
+                }`}
+              >
+                My Wallet ({shortAddress(wallet.address, 4, 4)})
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setWatch(deployments.agent)}
+              className={`px-2.5 py-1 rounded border text-xs transition-colors ${
+                activeHolder === deployments.agent
+                  ? "bg-primary text-primary-foreground border-primary font-bold"
+                  : "bg-white border-outline-variant hover:border-primary text-on-surface"
+              }`}
+            >
+              Treasury Agent ({shortAddress(deployments.agent, 4, 4)})
+            </button>
+            {isWatching && (
+              <button
+                type="button"
+                onClick={clearWatch}
+                className="px-2.5 py-1 rounded border border-outline-variant bg-white hover:bg-error-container hover:text-on-error-container text-xs text-on-surface-variant transition-colors"
+              >
+                Clear watch
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Positions Table */}
+        <div className="rounded-xl border border-outline-variant bg-white shadow-sm overflow-hidden">
           <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-outline-variant px-6 py-3">
             <span className="font-label-caps text-label-caps text-outline">MARKET VALUE</span>
-            <span className="font-data-mono text-data-mono text-on-background">
-              {myPositions.isLoading ? "Scanning ledger…" : `${formatUsdc(myPositions.totalValueRaw, { maxDecimals: 2, grouping: true })} USDC`}
+            <span className="font-data-mono text-data-mono text-on-background flex items-center gap-1.5">
+              {addressPositions.isLoading ? "Scanning ledger…" : formatUsdcDisplay(addressPositions.totalValueRaw)}
+              <SourceTag source="chain" />
             </span>
           </div>
-          {myPositions.error ? (
-            <p className="px-6 py-8 text-center text-sm text-error" role="alert">{myPositions.error}</p>
-          ) : !wallet.isConnected ? (
+          {addressPositions.error ? (
+            <p className="px-6 py-8 text-center text-sm text-error" role="alert">{addressPositions.error}</p>
+          ) : !activeHolder ? (
             <p className="px-6 py-8 text-center text-sm text-on-surface-variant">
-              Connect a Stellar wallet to see your on-chain positions.
+              Connect a Stellar wallet or enter an address above to inspect on-chain positions.
             </p>
-          ) : myPositions.isLoading ? (
+          ) : addressPositions.isLoading ? (
             <p className="px-6 py-8 text-center text-sm text-on-surface-variant" role="status">
               Reading Position entries from the market-core contract…
             </p>
-          ) : myPositions.rows.length === 0 ? (
+          ) : addressPositions.rows.length === 0 ? (
             <p className="px-6 py-8 text-center text-sm text-on-surface-variant">
-              {myPositions.totalMarkets === undefined || myPositions.totalMarkets === 0n
+              {addressPositions.totalMarkets === undefined || addressPositions.totalMarkets === 0n
                 ? "No on-chain markets exist yet."
-                : "Your wallet holds no position shares on-chain."}
+                : "This address holds no position shares on-chain."}
             </p>
           ) : (
             <ul className="divide-y divide-outline-variant">
-              {myPositions.rows.map((row) => {
+              {addressPositions.rows.map((row) => {
                 const settled = row.settlement !== null;
                 return (
                   <li key={row.marketId.toString()} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 px-6 py-3">
@@ -309,15 +495,18 @@ export default function PortfolioPage() {
                     <span className="font-data-mono text-data-mono font-semibold text-on-background">
                       {row.valueRaw === null ? "—" : `${formatUsdc(row.valueRaw, { maxDecimals: 2, grouping: true })} USDC`}
                     </span>
-                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
-                      row.settlement === "yes" || row.settlement === "no"
-                        ? "bg-secondary-container text-on-secondary-container"
-                        : row.settlement === "void"
-                          ? "bg-surface-container-highest text-on-surface-variant"
-                          : "bg-primary-container text-on-primary-container"
-                    }`}>
-                      {settled ? `Settled · ${row.settlement}` : "Open"}
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
+                        row.settlement === "yes" || row.settlement === "no"
+                          ? "bg-secondary-container text-on-secondary-container"
+                          : row.settlement === "void"
+                            ? "bg-surface-container-highest text-on-surface-variant"
+                            : "bg-primary-container text-on-primary-container"
+                      }`}>
+                        {settled ? `Settled · ${row.settlement}` : "Open"}
+                      </span>
+                      <SourceTag source="chain" />
+                    </div>
                     {row.archived && (
                       <span className="font-data-mono text-[10px] text-outline">archived</span>
                     )}
@@ -326,12 +515,17 @@ export default function PortfolioPage() {
               })}
             </ul>
           )}
-          {myPositions.scanLimited && (
+          {addressPositions.scanLimited && (
             <p className="border-t border-outline-variant px-6 py-2 text-xs text-on-surface-variant">
               The scan limit was reached; the newest markets were checked first.
             </p>
           )}
         </div>
+        {isWatching && (
+          <p className="text-[11px] text-on-surface-variant mt-2 italic">
+            Note: Trade and transaction history isn&apos;t available for watched addresses yet.
+          </p>
+        )}
       </section>
 
       {/* J4: Unified Gateway Balance Widget */}
@@ -348,12 +542,17 @@ export default function PortfolioPage() {
         <div className="flex gap-8">
           <div className="text-center">
             <div className="font-label-caps text-[10px] text-outline mb-1">AVAILABLE (STELLAR TESTNET)</div>
-            <div className="font-data-mono font-bold text-lg text-primary">{summary?.availableCapitalRaw ? formatUsdc(BigInt(summary.availableCapitalRaw), { maxDecimals: 2, grouping: true }) : "—"} USDC</div>
+            <div className="font-data-mono font-bold text-lg text-primary">{summary?.availableCapitalRaw ? formatUsdcDisplay(BigInt(summary.availableCapitalRaw)) : "—"}</div>
           </div>
           <div className="w-px h-10 bg-outline-variant self-center"></div>
           <div className="text-center">
             <div className="font-label-caps text-[10px] text-outline mb-1">DEPLOYED (BACKEND RECORD)</div>
-            <div className="font-data-mono font-bold text-lg text-secondary">{(summary?.deployedCapital ?? 0).toLocaleString()} USDC</div>
+            <div className="font-data-mono font-bold text-lg text-secondary">
+              {(() => {
+                const raw = floatUsdcToRaw(summary?.deployedCapital ?? 0);
+                return raw !== null ? formatUsdcDisplay(raw) : "—";
+              })()}
+            </div>
           </div>
         </div>
       </section>
@@ -423,7 +622,7 @@ export default function PortfolioPage() {
         </div>
 
         {!wallet.isConnected && <p className="mt-4 text-sm text-on-surface-variant">Connect a Stellar wallet to scan your positions.</p>}
-        {wallet.isWrongNetwork && <p className="mt-4 text-sm text-error">Switch your wallet to Stellar Testnet to redeem positions.</p>}
+        {wallet.isWrongNetwork && <p className="mt-4 text-sm text-error">Switch your wallet to {NETWORK_LABEL} to redeem positions.</p>}
         {redeemBatch.error && <p className="mt-4 text-sm text-error" role="alert">{redeemBatch.error}</p>}
 
         {redeemBatch.discovery && redeemBatch.discovery.redeemables.length > 0 && (
@@ -518,8 +717,9 @@ export default function PortfolioPage() {
                 <th className="px-4 py-4 font-semibold">SIDE</th>
                 <th className="px-4 py-4 font-semibold text-right">ENTRY</th>
                 <th className="px-4 py-4 font-semibold text-center">PROBABILITY</th>
-                <th className="px-4 py-4 font-semibold text-right">SIZE</th>
-                <th className="px-4 py-4 font-semibold text-right">PNL</th>
+                <th className="px-4 py-4 font-semibold text-right">SIZE (BACKEND RECORD)</th>
+                <th className="px-4 py-4 font-semibold text-right">EXIT VALUE (ON-CHAIN)</th>
+                <th className="px-4 py-4 font-semibold text-right">PNL (BACKEND RECORD)</th>
                 <th className="px-4 py-4 font-semibold text-center">STATUS</th>
                 <th className="px-6 py-4 font-semibold text-right">ACTIONS</th>
               </tr>
@@ -527,43 +727,80 @@ export default function PortfolioPage() {
             {isPositionsLoading ? (
               <tbody className="divide-y divide-outline-variant">
                 <tr>
-                  <td colSpan={8} className="px-6 py-8 text-center text-on-surface-variant">Loading positions...</td>
+                  <td colSpan={9} className="px-6 py-8 text-center text-on-surface-variant">Loading positions...</td>
                 </tr>
               </tbody>
             ) : positions.length === 0 ? (
               <tbody className="divide-y divide-outline-variant">
                 <tr>
-                  <td colSpan={8} className="px-6 py-8 text-center text-on-surface-variant">No active positions found.</td>
+                  <td colSpan={9} className="px-6 py-8 text-center text-on-surface-variant">No active positions found.</td>
                 </tr>
               </tbody>
             ) : (
               <VirtualTableBody
                 items={positions}
-                colSpan={8}
+                colSpan={9}
                 getKey={(pos) => pos.id}
                 estimateSize={() => 68}
                 restorationKey="portfolio_positions"
-                renderRow={(pos, _idx, a11y) => (
-                  <PositionRow 
-                    key={pos.id}
-                    ariaRowIndex={a11y["aria-rowindex"]}
-                    market={pos.market.question}
-                    category={pos.market.category}
-                    platform={pos.market.onChainMarketId !== null ? `On-chain #${pos.market.onChainMarketId}` : "Not on-chain"}
-                    side={pos.direction}
-                    sideColor={pos.direction === 'YES' ? "bg-secondary-container text-on-secondary-container" : "bg-tertiary-container text-on-tertiary-container"}
-                    entry={`$${pos.entryPrice.toFixed(2)}`}
-                    prob={pos.currentPrice ? Math.round(pos.currentPrice * 100) : 50}
-                    yesNo={pos.direction}
-                    size={pos.size.toLocaleString()}
-                    pnl={(pos.pnl ?? 0) >= 0 ? `+$${Math.abs(pos.pnl ?? 0).toFixed(2)}` : `-$${Math.abs(pos.pnl ?? 0).toFixed(2)}`}
-                    pnlPercent={`${(pos.pnl ?? 0) >= 0 ? '+' : ''}${(((pos.pnl ?? 0) / (pos.size * pos.entryPrice)) * 100 || 0).toFixed(1)}%`}
-                    pnlColor={(pos.pnl ?? 0) >= 0 ? 'text-secondary' : 'text-tertiary'}
-                    status={pos.status}
-                    resolved={pos.status !== 'OPEN'}
-                    claimable={pos.status === 'CLOSED'}
-                  />
-                )}
+                renderRow={(pos, _idx, a11y) => {
+                  const costRaw = floatUsdcToRaw(pos.size);
+                  const pnlRaw = pos.pnl !== null ? floatUsdcToRaw(pos.pnl) : null;
+                  const returnBps = pnlRaw !== null && costRaw !== null && costRaw > 0n ? ratioBps(pnlRaw, costRaw) : null;
+                  const chainId = pos.market.onChainMarketId;
+                  const valEntry = chainId !== null ? treasuryValuation.byMarketId.get(chainId) : undefined;
+                  const val = valEntry?.valuation;
+
+                  let exitValue = "—";
+                  let exitSubLabel: string | undefined;
+                  let cappedWarning: string | null = null;
+
+                  if (val) {
+                    if (val.basis === "resolution" && val.resolution !== null) {
+                      exitValue = formatUsdcDisplay(val.resolution);
+                      exitSubLabel = "Redeemable (on-chain)";
+                    } else if (val.basis === "mid-only") {
+                      exitValue = treasuryValuation.basis === "mid" ? formatUsdcDisplay(val.mid) : "—";
+                      exitSubLabel = "Closed, awaiting resolution";
+                    } else {
+                      exitValue = formatUsdcDisplay(
+                        treasuryValuation.basis === "mid" ? val.mid : val.liquidation.value,
+                      );
+                      exitSubLabel = treasuryValuation.basis === "mid" ? "Mid (on-chain)" : "Exit (on-chain)";
+                    }
+
+                    if (val.liquidation.capped && valEntry) {
+                      const soldShares = val.liquidation.sold.yes + val.liquidation.sold.no;
+                      const heldShares = valEntry.holding.yes + valEntry.holding.no;
+                      cappedWarning = `Only ${formatUsdc(soldShares, { maxDecimals: 2, grouping: true })} of ${formatUsdc(heldShares, { maxDecimals: 2, grouping: true })} shares sellable`;
+                    }
+                  }
+
+                  return (
+                    <PositionRow 
+                      key={pos.id}
+                      ariaRowIndex={a11y["aria-rowindex"]}
+                      market={pos.market.question}
+                      category={pos.market.category}
+                      platform={pos.market.onChainMarketId !== null ? `On-chain #${pos.market.onChainMarketId}` : "Not on-chain"}
+                      side={pos.direction}
+                      sideColor={pos.direction === 'YES' ? "bg-secondary-container text-on-secondary-container" : "bg-tertiary-container text-on-tertiary-container"}
+                      entry={formatProbability(pos.entryPrice)}
+                      prob={pos.currentPrice !== null ? Math.round(pos.currentPrice * 100) : null}
+                      yesNo={pos.direction}
+                      size={costRaw !== null ? formatUsdcDisplay(costRaw) : "—"}
+                      exitValue={exitValue}
+                      exitSubLabel={exitSubLabel}
+                      cappedWarning={cappedWarning}
+                      pnl={pnlRaw !== null ? formatSignedUsdc(pnlRaw) : "—"}
+                      pnlPercent={returnBps !== null ? formatBps(returnBps, { signed: true }) : "—"}
+                      pnlColor={(pos.pnl ?? 0) >= 0 ? 'text-secondary' : 'text-tertiary'}
+                      status={pos.status}
+                      resolved={pos.status !== 'OPEN'}
+                      claimable={pos.status === 'CLOSED'}
+                    />
+                  );
+                }}
               />
             )}
           </table>
@@ -656,6 +893,7 @@ export default function PortfolioPage() {
           onCancel={() => closeReview(false)}
         />
       )}
+      <ExportHistoryDialog open={exportOpen} onClose={() => setExportOpen(false)} />
     </main>
   );
 }

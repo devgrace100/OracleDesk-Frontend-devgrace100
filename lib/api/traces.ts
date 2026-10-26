@@ -1,4 +1,4 @@
-import { apiClient } from "./client";
+import { apiClient, type ApiRequestOptions } from "./client";
 import type { MarketCategory, PaginationMeta, SettlementCurrency } from "./markets";
 
 export type AgentType = "MARKET_MAKER" | "TRADER";
@@ -14,6 +14,8 @@ export interface ReasoningSource {
 
 export interface ReasoningTrace {
   id: string;
+  agentId?: string;
+  action?: string;
   marketId: string;
   agentType: AgentType;
   decisionType: string;
@@ -85,6 +87,9 @@ export interface SpendingAllowance {
   dailyLimit: number;
   perTraceLimit: number;
   currency: SettlementCurrency;
+  spentToday?: number;
+  lastResetAt?: string;
+  isActive?: boolean;
 }
 
 /**
@@ -96,35 +101,95 @@ export interface SpendingAllowance {
  */
 export interface PaymentEvent {
   id?: string;
-  type: UnlockType | string;
-  /** USDC moved by the verified transaction, in 7-decimal base units. */
+  type: UnlockType | "REFUND" | string;
+  /** USDC moved by the verified transaction, in 7-decimal base units (empty string if backend omitted raw amount). */
   amountRaw: string;
+  /** Legacy display float from backend; never used for export or transaction math. */
+  amount?: number;
   /** 64-hex Stellar transaction hash; unique across all payments. */
   txHash: string;
   /** Backend trace id this payment was recorded against; null for pass-all payments. */
   traceId?: string | null;
+  fromAddress?: string;
   walletAddress?: string;
   currency?: SettlementCurrency;
   /** Backend verification state; absent on the unlock receipt shape. */
-  status?: string;
+  status?: "PENDING" | "CONFIRMED" | "FAILED" | string;
   createdAt: string;
   confirmedAt?: string | null;
 }
 
-export async function listTraces(params: ListTracesParams = {}) {
-  const { data, meta } = await apiClient.get<ReasoningTrace[]>("/traces", { ...params });
+/**
+ * Runtime validator for backend `GET /traces/payments` rows.
+ * Rejects malformed entries while preserving `FAILED` and `PENDING` rows and
+ * rows where `amountRaw` was not recorded by the backend.
+ */
+export function parsePaymentEvent(raw: unknown): PaymentEvent | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.txHash !== "string" || r.txHash.trim().length === 0) return null;
+  if (typeof r.type !== "string" || r.type.trim().length === 0) return null;
+  if (typeof r.createdAt !== "string" || r.createdAt.trim().length === 0) {
+    return null;
+  }
+  const amountRaw =
+    typeof r.amountRaw === "string" && /^\d+$/.test(r.amountRaw.trim())
+      ? r.amountRaw.trim()
+      : "";
+  return {
+    ...(typeof r.id === "string" ? { id: r.id } : {}),
+    type: r.type,
+    amountRaw,
+    ...(typeof r.amount === "number" && Number.isFinite(r.amount)
+      ? { amount: r.amount }
+      : {}),
+    txHash: r.txHash.trim(),
+    traceId: typeof r.traceId === "string" ? r.traceId : null,
+    ...(typeof r.fromAddress === "string" ? { fromAddress: r.fromAddress } : {}),
+    ...(typeof r.walletAddress === "string"
+      ? { walletAddress: r.walletAddress }
+      : {}),
+    ...(r.currency === "USDC" ? { currency: "USDC" as const } : {}),
+    status: typeof r.status === "string" ? r.status : "CONFIRMED",
+    createdAt: r.createdAt,
+    confirmedAt: typeof r.confirmedAt === "string" ? r.confirmedAt : null,
+  };
+}
+
+export function validatePaymentEvents(rawList: unknown): {
+  events: PaymentEvent[];
+  invalidCount: number;
+} {
+  if (!Array.isArray(rawList)) {
+    return { events: [], invalidCount: rawList == null ? 0 : 1 };
+  }
+  const events: PaymentEvent[] = [];
+  let invalidCount = 0;
+  for (const item of rawList) {
+    const parsed = parsePaymentEvent(item);
+    if (parsed) {
+      events.push(parsed);
+    } else {
+      invalidCount += 1;
+    }
+  }
+  return { events, invalidCount };
+}
+
+export async function listTraces(params: ListTracesParams = {}, options?: ApiRequestOptions) {
+  const { data, meta } = await apiClient.get<ReasoningTrace[]>("/traces", { ...params }, options);
   return { traces: data, meta: isPaginationMeta(meta) ? meta : undefined };
 }
 
-export async function getTrace(id: string) {
-  const { data } = await apiClient.get<ReasoningTrace>(`/traces/${id}`);
+export async function getTrace(id: string, options?: ApiRequestOptions) {
+  const { data } = await apiClient.get<ReasoningTrace>(`/traces/${id}`, undefined, options);
   return data;
 }
 
-export async function verifyTrace(traceId: string) {
+export async function verifyTrace(traceId: string, options?: ApiRequestOptions) {
   const { data } = await apiClient.post<TraceVerification>("/traces/verify", {
     traceId,
-  });
+  }, undefined, options);
 
   return data;
 }
@@ -137,11 +202,11 @@ export const DAILY_PASS_TRACE_PLACEHOLDER = "00000000-0000-0000-0000-00000000000
  * the backend the transaction hash; it verifies the transfer on-chain.
  * Per-trace unlocks go through the x402 service instead.
  */
-export async function unlockDailyPass(traceId: string, txHash: string, amountRaw: string) {
+export async function unlockDailyPass(traceId: string, txHash: string, amountRaw: string, options?: ApiRequestOptions) {
   const { data } = await apiClient.post<{
     subscription: unknown;
     trace: ReasoningTrace | null;
-  }>(`/traces/${traceId}/unlock`, { txHash, amountRaw, type: "DAILY_PASS" satisfies UnlockType });
+  }>(`/traces/${traceId}/unlock`, { txHash, amountRaw, type: "DAILY_PASS" satisfies UnlockType }, undefined, options);
 
   return data;
 }
@@ -155,8 +220,8 @@ export function activateDailyPass(txHash: string, amountRaw: string) {
   return unlockDailyPass(DAILY_PASS_TRACE_PLACEHOLDER, txHash, amountRaw);
 }
 
-export async function getSpendingAllowance() {
-  const { data } = await apiClient.get<SpendingAllowance | null>("/traces/access/allowance");
+export async function getSpendingAllowance(options?: ApiRequestOptions) {
+  const { data } = await apiClient.get<SpendingAllowance | null>("/traces/access/allowance", undefined, options);
   return data;
 }
 
@@ -164,12 +229,20 @@ export async function setSpendingAllowance(allowance: {
   dailyLimit: number;
   perTraceLimit: number;
   currency?: SettlementCurrency;
-}) {
-  const { data } = await apiClient.put<SpendingAllowance>("/traces/access/allowance", allowance);
+}, options?: ApiRequestOptions) {
+  const { data } = await apiClient.put<SpendingAllowance>("/traces/access/allowance", allowance, options);
   return data;
 }
 
-export async function getPaymentEvents() {
-  const { data } = await apiClient.get<PaymentEvent[]>("/traces/payments");
-  return data;
+export async function getPaymentEventsWithValidation(options?: ApiRequestOptions): Promise<{
+  events: PaymentEvent[];
+  invalidCount: number;
+}> {
+  const { data } = await apiClient.get<unknown>("/traces/payments", undefined, options);
+  return validatePaymentEvents(data);
+}
+
+export async function getPaymentEvents(options?: ApiRequestOptions): Promise<PaymentEvent[]> {
+  const { events } = await getPaymentEventsWithValidation(options);
+  return events;
 }

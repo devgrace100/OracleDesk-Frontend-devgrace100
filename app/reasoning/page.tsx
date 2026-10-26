@@ -1,12 +1,25 @@
 "use client";
 import { Icon } from "@/components/ui/icon";
 
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import Link from "next/link";
 import { useInfiniteTraces } from "@/lib/hooks/useTraces";
 import { mergeTracePages } from "@/lib/hooks/trace-feed";
-import type { ReasoningTrace } from "@/lib/api/traces";
+import { getTrace, type ReasoningTrace } from "@/lib/api/traces";
+import { useWallet } from "@/lib/contexts/WalletContext";
+import { X402_ENABLED, useUnlockCart } from "@/lib/hooks/useX402";
+import { UnlockCart } from "@/components/trace/unlock-cart";
+import { parseUsdc } from "@/lib/stellar/units";
+
+/** Fallback daily-pass price when no trace quoted one (same rule as /premium). */
+const DAILY_PASS_PRICE_RAW = parseUsdc(process.env.NEXT_PUBLIC_DAILY_PASS_PRICE_USDC || "0.5");
+
+interface CartControl {
+  inCart: boolean;
+  note?: string;
+  onToggle: () => void;
+}
 
 import { VirtualList } from "@/components/ui/virtual-list";
 
@@ -150,6 +163,10 @@ export default function ReasoningFeedPage() {
   } = useInfiniteTraces();
   const traces = useMemo(() => mergeTracePages(data?.pages.map((page) => page.traces) ?? []), [data]);
   const totalCount = data?.pages[0]?.meta?.total ?? traces.length;
+  const { address } = useWallet();
+  const cart = useUnlockCart(address);
+  const quotedPassRaw = traces.find((t) => /^\d+$/.test(t.dailyPassPriceRaw ?? ""))?.dailyPassPriceRaw;
+  const dailyPassPriceRaw = quotedPassRaw ? BigInt(quotedPassRaw) : DAILY_PASS_PRICE_RAW;
 
   return (
     <main className="pt-24 pb-12 px-gutter max-w-container-max-width mx-auto">
@@ -221,6 +238,7 @@ export default function ReasoningFeedPage() {
           </div>
         )}
       </div>
+      <UnlockCart cart={cart} dailyPassPriceRaw={dailyPassPriceRaw} />
     </main>
   );
 }

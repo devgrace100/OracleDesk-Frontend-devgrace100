@@ -50,6 +50,16 @@ export const CONTRACTS = {
 } as const;
 
 /**
+ * Expected USDC asset identifier (CODE:ISSUER). Defaults to USDC:deployer on testnet.
+ */
+export const USDC_ASSET = env(
+  process.env.NEXT_PUBLIC_USDC_ASSET,
+  NETWORK_PASSPHRASE === TESTNET_PASSPHRASE ? `USDC:${deployments.deployer}` : "",
+  "USDC_ASSET"
+);
+
+
+/**
  * Recipient of premium payments. Must match the backend's PAYMENTS_RECIPIENT
  * or the backend will reject the payment. Defaults to the treasury, like the
  * backend (see docs/api.md for why that is a product decision).
@@ -157,7 +167,10 @@ export const X402_URL = env(process.env.NEXT_PUBLIC_X402_URL, "", "X402_URL");
 export const WALLETCONNECT_PROJECT_ID = env(process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID, "");
 /** Public URL of this app, shown to the wallet while it pairs. */
 export const APP_URL = env(process.env.NEXT_PUBLIC_APP_URL, "http://localhost:3000");
-export const WALLETCONNECT_CHAIN = NETWORK_PASSPHRASE === TESTNET_PASSPHRASE ? "stellar:testnet" : "stellar:pubnet";
+/** CAIP-2 id of the configured network (x402, WalletConnect and per-network storage keys). */
+export const STELLAR_NETWORK_ID: "stellar:testnet" | "stellar:pubnet" =
+  NETWORK_PASSPHRASE === TESTNET_PASSPHRASE ? "stellar:testnet" : "stellar:pubnet";
+export const WALLETCONNECT_CHAIN = STELLAR_NETWORK_ID;
 
 export const explorerTx = (hash: string) => `${EXPLORER_URL}/tx/${hash}`;
 export const explorerAccount = (address: string) =>

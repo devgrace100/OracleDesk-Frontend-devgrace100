@@ -89,6 +89,36 @@ Never edit `lib/stellar/generated/` by hand. If you think a contract needs
 to change, write it up in [docs/contract-requests.md](docs/contract-requests.md)
 and open the issue in the contracts repo.
 
+### x402 contract tests
+
+`e2e/x402/` runs the frontend's x402 client (`lib/x402/client.ts`) against the
+real trace service from the submodule (`x402/trace-api.ts`), fully offline: a
+stub facilitator (`e2e/x402/stub-facilitator.ts`) checks the signed payment,
+a fake gateway serves the fixtures in `e2e/x402/fixtures/traces/`, the Soroban
+RPC is answered in-process, and any connection to a non-loopback host fails.
+CI runs it as the `x402-contract` job.
+
+```bash
+npm ci --ignore-scripts --prefix contracts/oracledesk-stellar/x402   # the service's own dependencies
+npm run check:x402       # frontend and service resolve the same @x402/* versions
+npx tsc -p e2e/x402      # typecheck the harness (kept out of the app's tsconfig)
+npm run e2e:x402
+```
+
+When the submodule moves:
+
+1. Run `npm ci --ignore-scripts --prefix contracts/oracledesk-stellar/x402`, then `npm run check:x402`. If the service now resolves
+   different `@x402/*` versions, pin the frontend to exactly those
+   (`npm install --save-exact @x402/core@<v> @x402/stellar@<v>`) and read
+   the release notes for header, payload or settlement-flow changes.
+2. Run `npm run e2e:x402`. "contracts/x402 API changed: update
+   e2e/x402/harness.ts and the frontend client" means `createTraceApi` or
+   `MapTraceRepository` moved or changed shape: adapt `e2e/x402/harness.ts`,
+   then `lib/x402/client.ts` if the wire format changed.
+3. If the service's trace format changes, regenerate the fixture with the
+   submodule's `agents/core/trace.ts` `buildTrace` (canonical JSON) and update
+   `FIXTURE_TRACE_HASH` in `e2e/x402/harness.ts` to its sha256.
+
 ## Working on a Drips Wave issue
 
 This repo takes part in [Drips Wave](https://docs.drips.network/wave/).
@@ -122,10 +152,70 @@ filed.
   (`lib/stellar/units.ts`), never floats, for anything that reaches a
   transaction.
 
-## Never commit secrets
+## Number and money formatting
 
-No `.env*` files (only `.env.example`), no Stellar secret seeds (`S…`), no
-API keys. Every `NEXT_PUBLIC_*` variable ends up in browser JavaScript, so a
-secret must never go in one. If you commit a secret by accident, tell a
-maintainer privately (see [SECURITY.md](SECURITY.md)) so it can be rotated;
-removing it in a later commit is not enough.
+All money, basis-point, and probability display strings in `app/` must go
+through [`lib/format/money.ts`](lib/format/money.ts):
+
+- **USDC amounts (`formatUsdcDisplay`)**: 2 decimal places by default,
+  truncating toward zero (never rounding up money the user does not have),
+  always grouped (`en-US` commas), with a ` USDC` suffix and no `$` symbol.
+  Non-zero dust below `0.01 USDC` renders as `< 0.01 USDC`. Compact notation
+  (`{ compact: true }`) uses integer `bigint` division (`1.23M USDC`, `14.1K USDC`).
+- **Signed USDC PnL (`formatSignedUsdc`)**: explicit `+` or `−` (U+2212) sign
+  for non-zero displayed amounts, and `0.00 USDC` without a sign when zero or
+  truncated to zero.
+- **Basis points (`formatBps`) and probabilities (`formatProbability`)**:
+  probabilities render with 1 decimal place and a `%` suffix; signed basis-point
+  changes render with 2 decimal places by default.
+- **Backend float records (`floatUsdcToRaw`)**: always prefer `*Raw` decimal
+  string fields when the API provides them (`availableCapitalRaw`,
+  `seedAmountRaw`, `collateralRaw`, `amountRaw`). Remaining backend float-only
+  fields are converted once at the boundary via `floatUsdcToRaw` and labelled as
+  `backend record` in the UI.
+- **Lint enforcement**: `eslint.config.mjs` bans `.toFixed` and
+  `.toLocaleString` on money-named identifiers and `$`-prefixed template
+  literals in `app/**/*.tsx`. If a non-money value matches the naming
+  heuristic, rename the identifier or add
+  `// eslint-disable-next-line no-restricted-syntax -- not money: <reason>`.
+
+## Dialogs
+
+Modal flows (market quick-view, copy-trade, premium checkout, and trace verification) must use the accessible primitive in `components/ui/dialog.tsx`:
+- Always wrap modal content in `Dialog`, `DialogContent`, and provide an accessible name via `DialogTitle` (use `className="sr-only"` if visually redundant) and `DialogDescription`.
+- Choose the appropriate initial focus using `initialFocusRef` (e.g. amount input or primary action control).
+- Announce transaction lifecycle states and settled quotes politely via `components/ui/live-region.tsx` (`<LiveRegion message="..." />`) without announcing in-progress or raw URLs.
+- Mark simulated or blurred background elements as `aria-hidden="true"` and `inert` to keep them out of the accessibility tree and tab order.
+- Block dismissals (Escape or outside click) during active transaction submissions to prevent accidental orphan states, and announce the reason why.
+
+## Navigation and routes
+
+The site header navigation routes are declared in a single source of truth: `components/layout/nav-items.ts` (`NAV_ITEMS`).
+- Any new primary route or nested route section must be added to `NAV_ITEMS`.
+- Active styling is computed using `isActive(item, pathname)`.
+- The single exact link carrying `aria-current="page"` is resolved using `activeHref(pathname)`. Exact child matches take precedence over section parent links.
+- Desktop dropdown navigation is powered by Radix `NavigationMenu` (disclosure navigation with keyboard arrow navigation and Escape support).
+- Mobile navigation is rendered by `MobileNav.tsx` using Radix `Dialog` as an accessible sheet that traps focus and auto-closes on route changes.
+
+## Bumping the contracts submodule
+
+When the contracts repository changes:
+
+1. Update the pinned submodule:
+   ```bash
+   git -C contracts checkout <commit-or-tag>
+   npm run sync:bindings
+   ```
+2. Run the interface change report:
+   ```bash
+   npm run spec:diff
+   ```
+   This decodes embedded contract specifications from both the base branch and the new bindings, producing a structured diff of functions, types, error codes, and events.
+
+### Clearing CI spec-diff failures
+
+- **Uncovered Contract Errors**: If a new contract error code was added without a friendly user-facing message, add an entry describing it to `FRIENDLY` in `lib/stellar/errors.ts` (or add it to `UNFRIENDLY_ALLOWLIST` with justification if it is internal/admin-only).
+- **Breaking Call-Site References**: If a contract function was removed or its signature changed, update the calling code in `lib/`, `app/`, `components/`, or `e2e/` so no dead or mismatched invocations remain.
+- **Renumbered Error Codes**: Renumbering existing error codes breaks client-side error mapping and is rejected. Coordinate with contract maintainers to deprecate rather than renumber codes.
+- **Event Changes**: Changes to `Trade` or `TracePublished` events flag a requirement for backend indexer review.
+

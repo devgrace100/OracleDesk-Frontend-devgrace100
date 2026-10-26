@@ -10,6 +10,8 @@ import { InboxProvider } from "@/lib/notifications/InboxProvider";
 import { PwaRegistrar } from "@/components/pwa/pwa-registrar";
 import { DebugMount } from "@/components/debug/debug-mount";
 import { RpcDegradedBanner } from "@/components/debug/RpcPanel";
+import { NetworkConsistencyBanner } from "@/components/layout/NetworkConsistencyBanner";
+import { CopyTradeReconciler } from "@/components/copy-trade/CopyTradeReconciler";
 import { WebVitals } from "@/app/web-vitals";
 import { CommandPalette } from "@/components/command-palette/CommandPalette";
 
@@ -57,14 +59,24 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} ${inter.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col font-body-md text-on-surface">
+        <a
+          href="#main-content"
+          className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-[100] focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-md focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary-foreground font-label-caps"
+        >
+          Skip to main content
+        </a>
         <PwaRegistrar>
           <WalletProvider>
+            <CopyTradeReconciler />
             <RealtimeProvider>
               <HealthProvider>
                 <InboxProvider>
                   <Navbar />
+                  <NetworkConsistencyBanner />
                   <RpcDegradedBanner />
-                  {children}
+                  <div id="main-content" tabIndex={-1} className="flex-1 flex flex-col outline-none">
+                    {children}
+                  </div>
                   <Footer />
                   <DebugMount />
                   <CommandPalette />
@@ -72,7 +84,8 @@ export default function RootLayout({
                 </InboxProvider>
               </HealthProvider>
             </RealtimeProvider>
-          </WalletProvider>
+          </ViewedAddressProvider>
+        </WalletProvider>
         </PwaRegistrar>
       </body>
     </html>

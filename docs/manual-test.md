@@ -68,6 +68,17 @@ Needs `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` set and this origin allowed in the 
 
 ## 6. See your balance
 
+- [ ] Start a copy-trade quote, switch Freighter to Mainnet while its signature
+  prompt is open, wait for the network check (or return to the tab), and approve.
+  The app refuses submission and purges old chain results. No buy is sent.
+- [ ] Use a wallet that cannot report its network. The menu says **Network:
+  unknown**; signing is blocked until **I confirm my wallet is on Stellar Testnet**
+  is selected. Disconnect and reconnect: confirmation is required again.
+- [ ] Point the configured RPC at a different network. A non-dismissable banner
+  blocks reads/signing. Restore the RPC and click **Retry network check**.
+- [ ] Return a login challenge with a different network passphrase. Sign-in
+  explains the server mismatch without opening a wallet signature prompt.
+
 - [ ] Open the wallet menu (top right). It says **Stellar Testnet** and shows **100.00 USDC**.
 - [ ] Switch Freighter to Mainnet: the menu shows **Wrong network** in red. Switch back to Testnet.
 - [ ] "Copy address" copies your G-address; "View on Stellar Expert" opens your testnet account page.
@@ -99,6 +110,23 @@ To try the same on market 0 (resolved): the buy button is disabled and the panel
 - [ ] On the same page: "Your position: N YES · 0 NO" with a `chain` tag.
 - [ ] The YES price moved up from 50%.
 
+## 8a. Claim the pool remainder
+
+- [ ] Create a market with `seed-market.sh` using your own tester key as creator.
+  Open its quick view with the same wallet. **Your market liquidity** shows
+  on-chain reserves, an explicitly estimated value while Open, and fees labelled
+  as going to the treasury. Other wallets and treasury-created markets have no
+  creator panel. Seed figures appear only when the backend metadata exactly
+  reproduces the on-chain initial reserves and sets minted.
+- [ ] While Open, **Claim pool remainder** is disabled. Have a maintainer resolve
+  or void the market, then refresh. Claimable USDC equals the winning reserve
+  (or floor of half the reserve sum for Void); it excludes fees.
+- [ ] Claim, approve the wallet prompt, and follow the transaction link. The
+  panel changes to **Claimed**, balances refresh, and claiming again is refused.
+  An empty final pool can still be claimed to mark it settled with a zero payout.
+- [ ] Redeem ordinary seed YES/NO shares separately. A pool claim does not redeem
+  positions or sweep treasury fees.
+
 ## 9. Verify a trace
 
 - [ ] Open `http://localhost:3000/reasoning/verify?onChainTraceId=1` and click **Begin verification**.
@@ -120,6 +148,13 @@ To try the same on market 0 (resolved): the buy button is disabled and the panel
 - [ ] Verify the same fee preview, spendable XLM display, and blocking warnings appear on `/copy-trade` (next to slippage text) and `/premium` (in the checkout modal above the pay button).
 
 ## Also worth clicking
+
+- [ ] Copy a trade while blocking `/trade/copy/*/confirm` in DevTools. The buy
+  succeeds and the unconfirmed-trades panel retains its hash. Reload onto
+  `/portfolio`, unblock the route, and verify the trade becomes recorded
+  without a second buy or signature. Expire the JWT during recording: only the
+  explicit sign-in button should request one new login. Switch wallets during
+  reconciliation: the old wallet's entries disappear and never use the new JWT.
 
 - [ ] `/premium` → **Get a daily pass** → **Pay with wallet**. Freighter shows a USDC `transfer` to the treasury (`CBTFA3EP…`) for 0.50 USDC. After approval the backend verifies it on-chain and says the pass is active. Note: until `PAYMENTS_RECIPIENT` is decided, this payment becomes treasury trading capital (see docs/STATUS.md).
 - [ ] `/copy-trade?marketId=<backend market id>&traceId=<trace id>`: the side comes from the trace's edge. With no trace or zero edge the confirm button is disabled and the page explains why.
@@ -223,3 +258,57 @@ Needs a backend implementing the contract in the PR description.
 
 - Set `NEXT_PUBLIC_STELLAR_RPC_URLS=https://invalid.example,https://soroban-testnet.stellar.org`, open `?debug=rpc`; block one host in DevTools and watch failover. A buy during the switch uses one host.
 - `?debug=1` or Ctrl/Cmd+Shift+D opens the debug panel; "Copy diagnostics" previews redacted JSON.
+
+## Market generation tracking (#78)
+
+Needs a local backend with your wallet in `ADMIN_ADDRESSES` (and in `NEXT_PUBLIC_ADMIN_ADDRESSES`).
+- /admin/create shows the explanation and a single **Start market-maker run** button: no question, category, expiry, liquidity or AI fields, no remote image. Double-clicking starts one run (one job row; DevTools → Network shows one `POST /markets/generate` with an `Idempotency-Key` and body `{}`).
+- The row shows **Running** with a live elapsed time; the job events feed shows "Job … started …" and "Still running (…)". Requests to `/markets/generation-status/:jobId` go out every 5 s, every 15 s after two minutes.
+- Reload mid-run: the row and its elapsed time come back from `localStorage` (`oracledesk_admin_jobs:stellar:testnet:<address>`), and polling resumes.
+- On completion: **Completed**, the market question, **Open market** → `/markets/quick-view?marketId=…`, and the on-chain id. Polling stops. /admin's **Recent generation runs** lists it.
+- With `CHAIN_MODE=dry-run` on the backend: the row says "Created in the database only. The backend is in dry-run mode or on-chain creation failed; check backend logs."
+- Restart the backend while a job runs: the row becomes **Unknown** with the backend's message and a **Check recent markets** link; polling stops.
+- A job id the backend never saw (or pruned after an hour on a long-running server): **Not tracked**, polling stops.
+- Clear the JWT (`localStorage.removeItem("oracledesk_token")`) mid-run: the row says "Sign in again to keep tracking"; **Sign in** resumes polling.
+- Start six runs within an hour: the counter reaches "5 of 5" and the sixth gets "The backend allows 5 runs per hour. Try again in …" with no new row.
+- Open /admin/create in a second tab: a run started in one tab appears in the other. Switch to another admin wallet: only that wallet's runs show.
+
+## x402 unlocks: recovery (#75) and cart (#76)
+
+Needs a local x402 service (`contracts/oracledesk-stellar/x402`, `npm start`) behind the same origin or with CORS (see `docs/contract-requests.md` item 7), `NEXT_PUBLIC_X402_URL` pointing at it, a facilitator, a wallet with Soroban auth-entry signing (Freighter), and testnet USDC of the asset in the 402 (Circle testnet USDC by default).
+- `/reasoning/detail?onChainTraceId=<id>` shows **Unlock for 0.01 USDC**. Unlock: one wallet prompt, then "Unlocked. The content matches the on-chain trace hash." DevTools → Application → IndexedDB → `oracledesk-x402` → `payments` holds the entry (`delivered`), with no trace content.
+- Kill the service after the facilitator settles, then reload: the app-wide banner says a payment is waiting; the panel says "Your payment is saved…" with **Retry delivery**, never a new **Unlock for** button and never a new wallet prompt.
+- Restart the service and **Retry delivery**: delivered without signing again (Network: the same `PAYMENT-SIGNATURE` value).
+- Make the gateway serve other bytes for the CID: 502, nothing charged, the payment stays retryable.
+- Leave a rejected payment until its "Valid until ledger" passes: the panel offers **Pay again (previous payment expired unpaid)**.
+- Private window with storage blocked: the panel refuses to sign and says why.
+- Two tabs on the same trace, click both: only one wallet prompt at a time.
+- /reasoning: **Add to unlock list** on three locked traces, open **Unlock list (3)**: each row gets its price from the 402. Start checkout: three prompts, one after another. Raise `TRACE_PRICE_USDC` mid-run: the run pauses with accept / accept for all / skip. Kill the service on the second item: the receipt marks it failed and flags it; reopening that trace retries delivery without paying. **Download receipt (JSON)** totals equal the sum of paid amounts.
+- With a total at or above the daily-pass price, the drawer recommends a daily pass and links to /premium.
+- `NEXT_PUBLIC_X402_URL` empty: no cart, no unlock list buttons, no panel, no banner.
+
+## Watch-only mode (#141)
+
+Inspect any public Stellar address's positions and portfolio without connecting its private key.
+
+1. **Direct URL navigation**:
+   - [ ] Navigate to `http://localhost:3000/portfolio?watch=GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7`.
+   - [ ] The top banner shows: **Viewing GAAZI4TC...CCWN7 in Watch-Only Mode · Stop watching**.
+   - [ ] Portfolio balance and positions reflect the watched address.
+   - [ ] Reload the page without `?watch=`: the watch mode persists via `sessionStorage`.
+
+2. **Watch from Portfolio UI**:
+   - [ ] Open `/portfolio` and locate the "Watch any Stellar address" card.
+   - [ ] Enter a valid G-address or click a quick-pick button (e.g., "Treasury Agent").
+   - [ ] Click **Watch Address**. The page updates to display positions for that address with on-chain verification tags (`chain`).
+   - [ ] If an invalid address or muxed address (`M...`) is entered, the form displays a validation error ("Invalid Stellar public key format...").
+
+3. **Write protection (Watch vs Signer)**:
+   - [ ] While in watch mode, navigate to `/markets/quick-view?onChainId=0`.
+   - [ ] The trade ticket detects watch-only mode: the Buy button is disabled and displays **Watching. Connect your own wallet to trade.** with an explanatory note below.
+   - [ ] Connect your own wallet (e.g. Wallet A) while watching Wallet B:
+     - Positions displayed remain Wallet B.
+     - Attempting to submit a trade blocks with a clear user-facing error explaining you cannot transact on behalf of a watched address.
+   - [ ] Click **Stop watching** (in banner or wallet dropdown):
+     - The watch state clears, URL parameter is stripped, and the UI immediately switches to displaying Wallet A's own positions and balances.
+

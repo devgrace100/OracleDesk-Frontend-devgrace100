@@ -1,17 +1,20 @@
 import { Address, nativeToScVal, rpc, scValToNative } from "@stellar/stellar-sdk";
 import { AssembledTransaction, Client as ContractClient, Spec } from "@stellar/stellar-sdk/contract";
-import type { ClientOptions, SignTransaction } from "@stellar/stellar-sdk/contract";
+import type { ClientOptions, SignAuthEntry, SignTransaction } from "@stellar/stellar-sdk/contract";
 import { Client as MarketCoreClient, type Category, type Outcome } from "./generated/market-core";
 import { Client as TreasuryClient } from "./generated/treasury";
 import { Client as ResolverClient } from "./generated/resolver";
 import { Client as ReasoningRegistryClient } from "./generated/reasoning-registry";
 import { CONTRACTS, NETWORK_PASSPHRASE, RPC_URL, RPC_URLS } from "./config";
 import { getRpcPool, type RpcPool } from "./rpc-pool";
+import { assertRpcNetwork } from "./rpc-network-guard";
 
 /** What a wallet provides to sign. Omit it for read-only simulation. */
 export interface Signer {
   publicKey: string;
   signTransaction: SignTransaction;
+  /** Signs a Soroban authorization-entry preimage (SEP-43). x402 payments need it. */
+  signAuthEntry?: SignAuthEntry;
 }
 
 /** The endpoint pool in the browser; null on the server (prerender, node tests), which uses RPC_URL. */
@@ -29,7 +32,17 @@ const servers = new Map<string, rpc.Server>();
 export function rpcServer(url: string = currentRpcUrl()): rpc.Server {
   let server = servers.get(url);
   if (!server) {
-    server = new rpc.Server(url, { allowHttp: url.startsWith("http://") });
+    const raw = new rpc.Server(url, { allowHttp: url.startsWith("http://") });
+    server = new Proxy(raw, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if (property !== "getNetwork") assertRpcNetwork();
+          return value.apply(target, args);
+        };
+      },
+    });
     servers.set(url, server);
   }
   return server;

@@ -18,12 +18,57 @@ A backend market links to the chain through `onChainMarketId` (market-core's `u6
 
 ## Wallet and login
 
+### User-scoped data
+
+Backend routes using `requireAuth` or `optionalAuth` use `userKeys`, prefixed
+with `["scope", walletOrDash, sessionIdOrDash]`. Trace bodies and lists,
+allowances, payments, positions, portfolio and admin jobs follow this rule.
+Public markets and platform statistics keep `publicKeys` and survive sign-out.
+The session id is random per sign-in and stored beside the session; bearer
+tokens never appear in query keys.
+
+`UserScopeStore.resetUserScope` runs synchronously on wallet disconnect,
+account change, invalid/expired token and sign-in. It cancels and removes only
+the previous user scope, aborts its mutation requests, detaches their pending
+observers, and discards late results. Chain caches are also removed on account
+change, disconnect and token invalidation. Scoped API requests bind to the
+expected session before sending and after receiving, so an old response cannot
+clear or populate a new session. `TOKEN_EXPIRED`, `INVALID_TOKEN` and
+`UNAUTHORIZED` with a token clear the session and notify the provider.
+
+Copy-trade reads traces through `useTrace`; it never retains a trace in an
+independent component-state cache. Add new authenticated hooks through the same
+key factory and `useScopedMutation` guard.
+
 `lib/stellar/WalletProvider.tsx` wraps `@creit.tech/stellar-wallets-kit` 2.5.0 (pinned: the last release built on `@stellar/stellar-sdk` 16, the same major as the contract bindings). The application and bindings share SDK 16; hardware-wallet internals can carry separate transitive versions.
 
 - The kit is imported dynamically in an effect, because it reads `localStorage` when its module loads.
 - A session the kit persisted is restored without prompting and without redirecting. Only a connect completed in the modal redirects to `/markets`.
 - After connecting, the wallet signs the backend's SEP-10 style challenge transaction (`signTransaction`, which every Stellar wallet supports; `signMessage` is not universal). The backend returns a JWT. A stored session for a different address is cleared, never reused.
 - `useWallet()` exposes `address`, `isWrongNetwork`, a `signer` for the binding clients, `openModal`, `ensureSession` and `disconnect`.
+
+### Runtime network consistency
+
+The provider checks RPC `getNetwork` on startup (two retries for unreachable
+servers). A passphrase mismatch shows a blocking banner and blocks the shared
+RPC transport, including chain reads outside React Query. Retry can recover
+after the operator repairs the endpoint. An unreachable RPC is shown separately
+and rechecked before signing; it is never treated as a confirmed mismatch.
+
+Wallet network state is `match`, `mismatch`, or `unknown`. Kit STATE_UPDATED
+contains the kit-selected network, so it is deliberately ignored as network
+evidence. `getNetwork` is probed before transaction, auth-entry and login signing,
+every 15 seconds for reporting wallets while visible, and on returning to the
+tab. Unknown wallets require an explicit confirmation in the wallet menu, per
+address/module; disconnect/reconnect forgets it. Storage failures are harmless.
+
+Account changes or a transition to a mismatched network invalidate the network
+epoch and purge chain caches. Signing and submission are separate steps: late
+signatures are discarded, and the lifecycle checks its captured epoch immediately
+before submission. Transactions already submitted continue being monitored and
+are never reported as failed merely because the wallet network changed.
+SEP-10 checks the backend's advertised passphrase against the app configuration
+before parsing or signing the challenge.
 
 ### Wallet context slices
 
@@ -61,12 +106,58 @@ from the browser during development.
 
 ## Contract calls
 
+### Durable copy-trade recording
+
+Copy trades have a local outbox under `oracledesk_copy_outbox:<wallet>`, capped
+at 50 entries with terminal records pruned first. It saves the backend intent
+before the wallet prompt and the immutable hash immediately after signing,
+before submission. It survives reloads; if storage is blocked, the trade still
+works with an in-memory outbox and the page asks the user to keep the tab open.
+
+One root reconciler verifies RPC SUCCESS and decodes the exact market-core buy
+(contract, trader, market, outcome and collateral amount from the backend
+payload) before confirming. Failed/mismatched transactions never confirm.
+Retries start at 5 seconds and cap at 10 minutes; entries older than 26 hours
+are abandoned because RPC history may have expired. Missing hashes are shown
+with account-history links and are never guessed. Auth errors pause until an
+explicit fresh sign-in; they never open a repeating wallet prompt.
+
+The copy-trade and portfolio panels expose recording state, Retry and Dismiss.
+Dismiss is local only: there is no backend cancellation endpoint, so rejected
+or abandoned intents can remain PENDING there. Per-tab in-flight locking avoids
+duplicate confirms in one tab; two tabs may PATCH the same immutable hash,
+which the backend handles idempotently. A saved hash can never be replaced.
+
+### Contract reads and writes
+
 - `lib/stellar/clients.ts` builds a generated binding `Client` per contract, optionally with the wallet as signer. The USDC Stellar Asset Contract has no Wasm and so no bindings; `token.balance` and `token.transfer` are built with `AssembledTransaction.build`.
 - Read-only clients are memoised by contract, RPC URL, passphrase and timeout. Each generated constructor decodes every base64 spec entry, so the first factory call caches the parsed `Spec`; signer-bound clients are then built with the base `contract.Client` from that spec, keyed by the signer object and `publicKey` in a `WeakMap`. All clients share one `rpc.Server` per URL (`rpcServer`), so quote and simulation calls reuse one HTTP client. `__resetClientCaches()` and `__specBuildCount()` exist only for the cache tests and benchmark.
 - Reads are simulations (no fee, no signature), except the batched market list described below. Write-adjacent reads deliberately stay on simulation so they cannot observe a ledger entry older than the write they are preparing.
 - `npm run bench:clients` measures generated-client construction and quote building against the cached path without network calls.
 - Writes (`useBuy`, `useSell`, `useRedeem`, `useUsdcTransfer`) check that a wallet is connected and on the right network, run fresh contract preflight checks, simulate, then `signAndSend`. A per-address queue serializes complete build/sign/send jobs in this tab and coordinates browser tabs with Web Locks (or a local-storage lease fallback); stale-sequence errors receive one fresh-build retry. The buy, sell, redeem, and USDC-transfer paths can decode the final simulated contract invocation and show its arguments and transaction envelope for review before the wallet prompt.
 - `useBuy` quotes again immediately before building the transaction and sets `min_shares_out = minOut(quote, slippageBps)`, so slippage is enforced on-chain.
+
+### Creator liquidity claims
+
+Quick-view shows a creator panel only for a matching connected G-address, and
+hides it on a network mismatch. `lpView` computes all values in bigint from the
+same on-chain market snapshot: the winning reserve for YES/NO, or floor of half
+the reserve sum for Void. Open pool value is a labelled spot-price estimate.
+Accrued fees belong to the treasury and never increase the creator's payout.
+
+Backend seed metadata is displayed only when its integer seed calculation
+reproduces the on-chain reserves and sets minted. After trades, or without
+matching metadata, seed figures are omitted. A MarketCreated event would be the
+authoritative historical seed source, but RPC event retention limits discovery.
+The fixtures record outputs from the pinned contracts Python model using the
+Rust creation and Void-claim test inputs.
+
+Claiming re-reads the market through simulation, checks creator, finality and
+`lp_claimed` before prompting, then signs/submits through the existing guarded
+queue and transaction lifecycle. Success invalidates market, position, USDC and
+account balances. A zero payout still marks the pool claimed. Normal creator
+seed shares must be redeemed separately; fees are swept separately by the
+treasury flow.
 
 ### Batched market reads
 
@@ -77,6 +168,10 @@ from the browser during development.
 ## Admin diagnostics
 
 `/admin` shows live diagnostics instead of demo data: backend and chain market counts, sampled status/probability comparisons, RPC latency, and the indexer's last ledger. The sampler reads the newest ten markets plus a rotating sample from the rest, uses the same batched ledger reader as the market list when possible, limits itself to three in-flight reads and a ten-reads-per-second token bucket, and links each mismatch to the affected market. `/admin/agents` merges registry events, `deployments.testnet.json` and `NEXT_PUBLIC_KNOWN_AGENTS`, reads live `is_registered` for each address, and offers register/unregister review with a typed confirmation. Neither page fabricates a healthy state.
+
+### Market generation jobs
+
+`/admin/create` starts one market-maker run with `POST /markets/generate` and an `Idempotency-Key` per click (the backend requires one; a retried request can't start a second paid run). It sends `{}`: the agent picks the question, category and close time itself. Started job ids are stored per admin address and network in `localStorage` (`oracledesk_admin_jobs:<network>:<address>`, newest first, at most 50; `lib/admin/job-store.ts`) and shared across components and tabs through `useSyncExternalStore` and the `storage` event, so each tab polls each job with one query. `useMarketGenerationStatus` polls `GET /markets/generation-status/:jobId` every 5 s, 15 s once the server's `elapsedMs` passes two minutes, and stops on `COMPLETED`, `FAILED`, `UNKNOWN` (the backend restarted; only its start log survived) or `404 JOB_NOT_FOUND` (pruned an hour after finishing), which maps to `NOT_FOUND`. Auth errors are not retried; polling pauses with "Sign in again to keep tracking". Elapsed time is the server's `elapsedMs` plus only the local time since that answer. The job feed is derived from these states (`lib/admin/job-events.ts`); a `COMPLETED` job with `onChainMarketId: null` is explained as dry-run or failed on-chain creation. "Open market" links to `/markets/quick-view?marketId=…`, never `marketUrl`, which is an API path. The "runs in the last hour" count covers this browser only; the backend's limit is 5 per hour per IP, and a 429 shows its `Retry-After`.
 
 ### Confirmed wallet updates and reconciliation
 
@@ -171,6 +266,43 @@ The on-chain `trace_hash` decides whether content is shown. Everything else is e
 - **Worker.** `lib/stellar/trace.worker.ts` runs the race, the incremental SHA-256 (`lib/stellar/sha256.ts`) and the JSON decode off the main thread, and posts progress. Only verified bytes are transferred back, as a transferable `ArrayBuffer`. Mismatches carry no bytes. `verifyTraceInWorker` falls back to the main thread when workers are unavailable, and does so for the rest of the session if the worker fails at runtime.
 - **CSP.** The worker is a same-origin module (`new Worker(new URL("./trace.worker.ts", import.meta.url), { type: "module" })`). A strict CSP needs `worker-src 'self'` and must not allow `blob:`. Gateway subdomain redirects (for example `dweb.link`) need `connect-src` entries too.
 
+## x402 per-trace unlocks
+
+`lib/x402/client.ts` talks to the contracts repo's trace service (`GET {NEXT_PUBLIC_X402_URL}/traces/:onChainTraceId`) with the same `@x402/*` release the service pins (2.26.0, exact; `npm run check:x402`). Protocol v2 over HTTP: the 402 carries `PAYMENT-REQUIRED` (base64 JSON `PaymentRequired`), the paid retry sends `PAYMENT-SIGNATURE` (base64 JSON `PaymentPayload`), and a settled 200 carries `PAYMENT-RESPONSE` (base64 JSON `SettleResponse`). The Stellar `exact` payment is a Soroban authorization entry for one SEP-41 `transfer(payer, payTo, amount)`, signed by the wallet with `signAuthEntry` (SEP-43); the facilitator builds, sponsors and submits the transaction. Every request sends `Accept: application/json`, because the middleware answers browsers that accept `text/html` with an HTML paywall.
+
+Facts of the pinned client worth knowing:
+
+- The wallet must support Soroban auth-entry signing (Freighter does). The adapter exposes the kit's `signAuthEntry`; signing refuses with a plain message when the wallet can't.
+- A bare price (the service's `TRACE_PRICE_USDC`, "0.01") is charged in `@x402/stellar`'s default asset: Circle's testnet USDC SAC `CBIELTK6…DAMA`, not the app's self-issued USDC. Amounts are always read from the 402.
+- Building the payment simulates the transfer on the app's Soroban RPC; the scheme passes no `allowHttp`, so that RPC must be https. It also asks Horizon (testnet: `horizon-testnet.stellar.org`) for recent ledger times and falls back to 5 s per ledger. The signature expires at `latest ledger + ceil(maxTimeoutSeconds / ledger seconds)`; `maxTimeoutSeconds` defaults to 300.
+
+### Payment journal and recovery (`lib/x402/recovery.ts`)
+
+Every signed payment is written to IndexedDB (`oracledesk-x402`, store `payments`, indexed by `[wallet, network, onChainTraceId]`) with `durability: "strict"`, and the write must commit before the paid request is sent. If IndexedDB is unavailable, the app refuses to sign. `unlockTrace` checks the journal first:
+
+- an entry in `signed`, `sent` or `failed-retryable` is **redelivered with the same header**, never re-signed, until its expiration ledger (compared with RPC `getLatestLedger`, not the clock);
+- network errors and 5xx keep the header and retry after 1 s, 3 s and 10 s;
+- a 402 to a paid request, or an entry past its expiration ledger, triggers a settlement check before anything else happens. Settled payments become `settled-undelivered` and are never paid again; the user gets "Retry delivery" and "Copy payment evidence". Unsettled ones only become `expired`, and safe to pay again, once the expiration ledger has passed;
+- a 200 whose `traceHash` differs from reasoning-registry's is a delivery failure (`settled-undelivered`, `hash-mismatch`). Otherwise the entry becomes `delivered`, and content is shown only after the IPFS bytes verify against the on-chain hash (`fetchVerifiedTrace`).
+
+The settlement check reads SEP-41 `transfer` events from the wallet to `payTo` on the requirement's asset, in the ledgers where the signature was valid. An event of the right amount counts only if its transaction carries this payment's auth entry (same payer and nonce), so same-priced payments in one batch are never confused. If events are missing for the window (RPC retention), the result is `unknown` and the payment stays retryable. Tabs coordinate through a Web Lock per wallet, network and trace, and a `BroadcastChannel("oracledesk-x402")` that refreshes other tabs' views. The payment header is a bearer credential until it settles or expires. It is never logged, never put into error text, and never part of the support evidence.
+
+**What the pinned `@x402/express` 2.26 does** (read from its source and pinned by `e2e/x402`):
+
+- (a) *Same header replayed after settlement*: there is no delivery cache. Every paid request is verified with the facilitator again, and an auth entry whose nonce was consumed fails verification, so the replay gets a 402, not content. It can't be charged twice either. A settled-but-undelivered payment can't be redelivered against this service (contract request 7).
+- (b) *Handler error after payment*: the Stellar `exact` scheme's default flow is `authorization`, which runs verify before the handler and settle after it, and only when the handler answered below 400. The handler's output is buffered meanwhile. A 502 (gateway down, tampered bytes) or 404 (unknown trace) cancels the payment and nothing is settled, so the same header can be resent until it expires. The middleware also prices the route before the handler looks the trace up, so an unknown id still answers 402 first.
+- (c) *Client disconnect mid-response*: settlement runs after the handler regardless of the client. A disconnect after `/settle` leaves the payment settled and the response lost; the journal recovers this as `settled-undelivered` through the settlement check.
+
+### Unlock cart (`lib/x402/cart.ts`)
+
+`/reasoning` can collect locked traces (deduplicated by on-chain id; traces not on-chain are rejected). Each is quoted from its live 402, three at a time. The backend's `unlockPriceRaw` is only a hint and is never shown as the charged amount. Checkout pays one item at a time through `unlockTrace`, so each payment has its journal entry and its own wallet prompt. Before every signature the item's 402 is read again:
+
+- a different `payTo`, asset or network is refused;
+- a higher price pauses the run until the user accepts it for this item, accepts it for all remaining items, or skips;
+- a lower price proceeds, and the receipt records both amounts.
+
+The spending policy runs after that. Without one, a conservative fallback keeps each payment within the run's confirmed total plus any increases the user accepted. A policy denial of `over-daily` or `over-per-trace` skips the rest of the run. Cancelling, or a wallet change, stops before the next item. The receipt (downloadable JSON, bigint amounts as strings) lists each item's status, quoted and paid amounts, settlement hash and verification result, and flags payments that went through without a verified unlock. When the total reaches the daily-pass price, the drawer recommends `/premium`. Everything x402 is hidden when `NEXT_PUBLIC_X402_URL` is empty.
+
 ## PWA and service worker
 
 `public/sw.js` (hand-written) is registered as `/sw.js?v=<BUILD_ID>` in production on secure origins only; `next dev` unregisters build workers.
@@ -189,4 +321,36 @@ Instead of independent intervals across components, `LedgerClock` (`lib/stellar/
 - **Exponential Backoff**: Success resets the interval to 5s; RPC failures back off through 10s, 20s, up to 60s with jitter.
 - **Event-Driven Invalidation**: Mounted in `WalletProvider` via `LedgerInvalidator` (`lib/stellar/ledger-invalidation.ts`). On new ledgers, `getEvents` queries `marketCore` and `usdc` to invalidate queries matching affected market IDs and user balances. Gaps > 120 ledgers perform a broad invalidation.
 - **Query Cache Policies**: On-chain queries have `staleTime: Infinity` with a 5-minute fallback poll; backend queries set `refetchIntervalInBackground: false`.
+
+## Contract integrity check (`lib/stellar/contract-check.ts`)
+
+At startup, the frontend verifies that the deployed contracts match the bundled TypeScript bindings:
+
+1. **Instance Check**: Queries persistent contract instance keys for all configured contracts (`marketCore`, `treasury`, `resolver`, `reasoningRegistry`, and `usdc`) in a single batched `getLedgerEntries` call.
+2. **Wasm Spec Fingerprint**: For Wasm contracts, extracts the executable's `wasmHash`, fetches the contract code entry if not cached, parses the embedded `contractspecv0` section, normalizes spec entries (stripping doc fields and sorting by kind and name), and computes a SHA-256 fingerprint. The fingerprint is cached in `sessionStorage` per content-addressed `wasmHash`.
+3. **Stellar Asset Contract (SAC) Verification**: For USDC, verifies that the instance executable is `contractExecutableStellarAsset`, checks that the contract ID matches `new Asset(code, issuer).contractId(NETWORK_PASSPHRASE)` for `NEXT_PUBLIC_USDC_ASSET`, and simulates `name()`.
+4. **Write-Path Gating**: `useContractIntegrity()` evaluates network status. If any contract status is `mismatch`, `not-found`, or `wrong-kind`, `useWriteGuard()` blocks transaction signing with a `UserFacingError({ kind: "contract" })`, and `IntegrityBanner.tsx` renders a non-dismissable alert detailing the discrepancies. Temporary RPC connectivity failures yield `unchecked` and do not block writes.
+
+## Viewed address vs signer (Watch-only mode)
+
+To allow inspecting any Stellar address's positions, balances, and history without connecting a wallet or risking accidental transactions from a signer wallet:
+
+1. **Branded Types (`lib/stellar/identity.ts`)**:
+   - `ViewedAddress`: A validated Stellar G-address (`G[A-Z2-7]{55}`) that is being inspected in the UI.
+   - `SignerAddress`: A connected wallet's address that can sign transactions.
+   - Distinct branded types ensure write paths cannot mistakenly pass a watched address to a signer client.
+2. **State & URL Synchronization (`lib/hooks/useViewedAddress.tsx`)**:
+   - Tracks `viewed`, `source` (`"url"` | `"session"` | `"signer"`), and `isWatching`.
+   - Priority order: URL query param `?watch=<G...>` takes highest precedence, followed by active `sessionStorage.getItem("oracledesk_watch")`, falling back to the connected wallet's `address`.
+   - Never stored in `localStorage` or `oracledesk_wallet`, preventing session mixups with the backend.
+   - Navigating or clicking "Clear watch" purges the watch session and invalidates user-scoped query caches.
+3. **Batched Position Reads (`lib/stellar/positions.ts`)**:
+   - `fetchPositionsFor(holder: ViewedAddress, marketIds: bigint[])` encodes `DataKey::Position(holder)` keys and batches up to 200 keys per chunk via `getLedgerEntries`.
+   - Missing or unbatched positions fallback to simulating `get_position(holder)`. Zero-balance positions are filtered out.
+4. **Write-Path Protection (`lib/stellar/write-guard.ts`)**:
+   - `assertCanWrite()` is evaluated in `useWriteGuard()`.
+   - If `isWatching` is true and `watchedAddress !== signer.publicKey`, it throws `UserFacingError({ kind: "watch-only", title: "Watch-only mode", message: "You are currently inspecting another address in watch-only mode. Connect or switch to this wallet to perform transactions." })`.
+   - UI trade buttons (Buy, Sell, Copy-Trade confirm) are disabled with explicit helper text ("Watching. Connect your own wallet to trade.").
+   - Copy-trade position sizing is strictly bound to the signer's actual USDC balance, never the watched address's funds.
+
 

@@ -2,6 +2,7 @@ import { Errors as MarketCoreErrors } from "./generated/market-core";
 import { Errors as TreasuryErrors } from "./generated/treasury";
 import { Errors as ResolverErrors } from "./generated/resolver";
 import { Errors as ReasoningRegistryErrors } from "./generated/reasoning-registry";
+import { NETWORK_LABEL } from "./config";
 
 export type ContractName = "marketCore" | "treasury" | "resolver" | "reasoningRegistry";
 
@@ -61,9 +62,21 @@ export const FRIENDLY: Record<string, string> = {
   DailyCapExceeded: "The treasury has reached its daily limit.",
   InsufficientBalance: "You don't have enough USDC for this.",
   // resolver
+  MarketAlreadyConfigured: "This market's resolution rule has already been configured.",
   MarketNotConfigured: "This market's resolution rule hasn't been revealed yet.",
   SpecHashMismatch: "That resolution rule doesn't match what this market committed to.",
   DisputeWindowOpen: "The dispute window is still open.",
+  InvalidPrice: "The oracle returned an invalid price for this asset.",
+  NotSigner: "Your wallet isn't one of this market's signers.",
+  AlreadyAttested: "You've already attested this outcome for this market.",
+  ThresholdNotReached: "Not enough signers have attested this outcome yet.",
+  DisputeActive: "A dispute is active for this market's resolution.",
+  NoProposal: "There's no resolution proposal for this market yet.",
+  AlreadyFinalized: "This market has already been finalized.",
+  MarketNotClosed: "This market hasn't closed yet.",
+  WrongMode: "This action doesn't match this market's resolution mode.",
+  StalePrice: "The price feed is too stale to resolve this market.",
+  PriceUnavailable: "No price is available to resolve this market yet.",
   // reasoning-registry
   TraceNotFound: "This reasoning trace isn't on-chain.",
   AgentAlreadyRegistered: "This agent is already registered.",
@@ -74,7 +87,12 @@ export const FRIENDLY: Record<string, string> = {
   // shared across contracts
   NotInitialized: "This contract hasn't been initialized yet.",
   InvalidFee: "Fees can be at most 10% (1000 bps).",
+  InvalidProbability: "Initial probabilities must add up to 100%.",
+  InvalidCloseTime: "The market's close time must be in the future.",
 };
+
+export const FRIENDLY_NAMES = Object.keys(FRIENDLY) as readonly string[];
+export const UNFRIENDLY_ALLOWLIST = ["NotInitialized", "InvalidConfig"] as const;
 
 import type { rpc } from "@stellar/stellar-sdk";
 
@@ -128,6 +146,7 @@ function safeJson(v: unknown): string {
 
 /** Turns anything thrown by the SDK, a binding or a wallet into a message for the user. */
 export function describeError(err: unknown, contract: ContractName = "marketCore"): DescribedError {
+  if (err instanceof UserFacingError) return err.described;
   const text = textOf(err);
 
   if (classifySequenceError(err)) {
@@ -194,8 +213,11 @@ export function describeError(err: unknown, contract: ContractName = "marketCore
   if (/op_low_reserve|txInsufficientBalance|tx_insufficient_balance/i.test(text)) {
     return { kind: "insufficient-xlm", message: "You don't have enough spendable XLM to pay the network fee." };
   }
+  if (err instanceof Error && err.name === "NetworkMismatchError") {
+    return { kind: "wrong-network", message: err.message };
+  }
   if (/wrong network|network mismatch/i.test(text)) {
-    return { kind: "wrong-network", message: "Switch your wallet to Stellar Testnet and try again." };
+    return { kind: "wrong-network", message: `Switch your wallet to ${NETWORK_LABEL} and try again.` };
   }
   // Admin-gated contract calls (e.g. market-core's require_admin) fail auth
   // for any non-admin signer; name this distinctly from a wallet rejection.
